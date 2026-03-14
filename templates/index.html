@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>🚴 Race Analyzer</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #0a0a0f;
+    color: #ddd;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    min-height: 100vh;
+  }
+  header {
+    background: #0d0d1a;
+    border-bottom: 1px solid #1e1e2e;
+    padding: 16px 20px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+  }
+  header h1 { font-size: 18px; font-weight: 700; }
+  header span { font-size: 10px; color: #444; letter-spacing: 2px; text-transform: uppercase; }
+  .container { max-width: 600px; margin: 0 auto; padding: 24px 16px; }
+
+  /* Upload zone */
+  .upload-zone {
+    border: 2px dashed #222238;
+    border-radius: 12px;
+    padding: 48px 20px;
+    text-align: center;
+    cursor: pointer;
+    transition: all 0.2s;
+    margin-bottom: 16px;
+  }
+  .upload-zone.dragover { border-color: #e8450a; background: rgba(232,69,10,0.05); }
+  .upload-zone .icon { font-size: 48px; margin-bottom: 12px; }
+  .upload-zone p { color: #888; font-size: 15px; margin-bottom: 6px; }
+  .upload-zone small { color: #444; font-size: 12px; }
+  input[type=file] { display: none; }
+
+  /* Previews */
+  .previews { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }
+  .preview-item {
+    background: #0d0d1a;
+    border: 1px solid #1e1e2e;
+    border-radius: 8px;
+    padding: 8px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .preview-item img { width: 52px; height: 52px; object-fit: cover; border-radius: 6px; }
+  .preview-item .info { font-size: 12px; }
+  .preview-item .info .name { color: #bbb; margin-bottom: 2px; }
+  .preview-item .info .size { color: #444; }
+
+  /* Button */
+  .btn {
+    width: 100%;
+    padding: 16px;
+    border: none;
+    border-radius: 10px;
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: 1px;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+  .btn-primary { background: #e8450a; color: #fff; }
+  .btn-primary:disabled { background: #1e1e2e; color: #444; cursor: not-allowed; }
+  .btn-secondary { background: transparent; color: #555; border: 1px solid #1e1e2e; margin-top: 12px; }
+
+  /* Progress */
+  .progress-wrap { margin: 24px 0; }
+  .steps { display: flex; gap: 0; margin-bottom: 20px; }
+  .step { flex: 1; text-align: center; }
+  .step-bar { height: 3px; background: #1e1e2e; margin-bottom: 6px; transition: background 0.4s; }
+  .step.done .step-bar { background: #e8450a; }
+  .step.active .step-bar { background: #e8450a88; }
+  .step-label { font-size: 9px; color: #444; text-transform: uppercase; letter-spacing: 1px; }
+  .step.done .step-label { color: #e8450a; }
+  .step.active .step-label { color: #bbb; }
+  .progress-msg { text-align: center; padding: 20px 0; }
+  .spinner { font-size: 40px; display: inline-block; animation: spin 1.8s linear infinite; }
+  .progress-msg p { color: #999; font-size: 14px; margin-top: 12px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* Results */
+  .summary {
+    display: flex;
+    gap: 16px;
+    background: #0d0d1a;
+    border: 1px solid #1e1e2e;
+    border-radius: 10px;
+    padding: 14px 16px;
+    margin-bottom: 20px;
+  }
+  .summary-stat { flex: 1; text-align: center; }
+  .summary-stat .val { font-size: 22px; font-weight: bold; color: #e8450a; }
+  .summary-stat .lbl { font-size: 9px; color: #444; text-transform: uppercase; letter-spacing: 1px; margin-top: 2px; }
+  .section-title { font-size: 10px; color: #555; letter-spacing: 3px; text-transform: uppercase; margin-bottom: 12px; }
+
+  /* Rider cards */
+  .rider-card {
+    background: #0d0d1a;
+    border: 1px solid #1e1e2e;
+    border-radius: 10px;
+    padding: 14px 14px;
+    margin-bottom: 8px;
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+  }
+  .rider-card.top3 { border-color: #e8450a33; background: rgba(232,69,10,0.04); }
+  .medal {
+    width: 34px; height: 34px;
+    border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 14px; font-weight: bold;
+    flex-shrink: 0;
+  }
+  .medal-1 { background: #FFD700; color: #111; }
+  .medal-2 { background: #C0C0C0; color: #111; }
+  .medal-3 { background: #CD7F32; color: #111; }
+  .medal-n { background: #1e1e2e; color: #666; }
+  .rider-info { flex: 1; min-width: 0; }
+  .rider-name { font-size: 15px; font-weight: 700; color: #eee; margin-bottom: 2px; }
+  .rider-meta { font-size: 11px; color: #555; margin-bottom: 4px; }
+  .rider-bib { font-size: 11px; color: #e8450a; font-weight: 600; }
+  .notable { font-size: 11px; color: #777; margin-top: 4px; line-height: 1.4; }
+  .no-data { font-size: 10px; color: #444; font-style: italic; margin-top: 4px; }
+  .stats { flex-shrink: 0; text-align: right; }
+  .stat-row { margin-bottom: 6px; }
+  .stat-val { font-size: 18px; font-weight: bold; }
+  .stat-val.wins { color: #FFD700; }
+  .stat-val.podiums { color: #aaa; }
+  .stat-val.top10 { color: #555; font-size: 14px; }
+  .stat-lbl { font-size: 8px; color: #444; letter-spacing: 1px; text-transform: uppercase; }
+
+  .error-box {
+    background: rgba(232,69,10,0.1);
+    border: 1px solid #e8450a44;
+    border-radius: 10px;
+    padding: 20px;
+    text-align: center;
+    margin: 20px 0;
+  }
+  .error-box p { color: #e8450a; margin-bottom: 8px; }
+  .error-box small { color: #666; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🚴 Race Analyzer</h1>
+  <span>1.12B · Belgian Cycling</span>
+</header>
+
+<div class="container">
+
+  <!-- UPLOAD VIEW -->
+  <div id="view-upload">
+    <div class="upload-zone" id="dropzone" onclick="document.getElementById('fileInput').click()">
+      <div class="icon">📋</div>
+      <p>Tap to upload start list</p>
+      <small>1 or 2 photos · auto-resized</small>
+    </div>
+    <input type="file" id="fileInput" accept="image/*" multiple>
+    <div class="previews" id="previews"></div>
+    <button class="btn btn-primary" id="analyzeBtn" disabled onclick="startAnalysis()">
+      Analyze Start List
+    </button>
+  </div>
+
+  <!-- PROGRESS VIEW -->
+  <div id="view-progress" style="display:none">
+    <div class="progress-wrap">
+      <div class="steps">
+        <div class="step" id="step1"><div class="step-bar"></div><div class="step-label">Extract</div></div>
+        <div class="step" id="step2"><div class="step-bar"></div><div class="step-label">Pre-rank</div></div>
+        <div class="step" id="step3"><div class="step-bar"></div><div class="step-label">Search FC</div></div>
+      </div>
+      <div class="progress-msg">
+        <div class="spinner">⚙️</div>
+        <p id="progressMsg">Reading start list...</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- RESULTS VIEW -->
+  <div id="view-results" style="display:none">
+    <div class="summary">
+      <div class="summary-stat"><div class="val" id="stat-total">—</div><div class="lbl">Riders</div></div>
+      <div class="summary-stat"><div class="val" id="stat-searched" style="color:#aaa">—</div><div class="lbl">Searched</div></div>
+      <div class="summary-stat"><div class="val" id="stat-found" style="color:#666">—</div><div class="lbl">Found on FC</div></div>
+    </div>
+    <div class="section-title">Top 10 — Podiums & Results (2024–2025)</div>
+    <div id="rankings"></div>
+    <button class="btn btn-secondary" onclick="reset()">← New Race</button>
+  </div>
+
+  <!-- ERROR VIEW -->
+  <div id="view-error" style="display:none">
+    <div class="error-box">
+      <p id="errorMsg">Something went wrong</p>
+      <small id="errorDetail"></small>
+    </div>
+    <button class="btn btn-secondary" onclick="reset()">Try Again</button>
+  </div>
+
+</div>
+
+<script>
+let selectedFiles = [];
+
+const dropzone = document.getElementById('dropzone');
+const fileInput = document.getElementById('fileInput');
+const analyzeBtn = document.getElementById('analyzeBtn');
+
+dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('dragover'); });
+dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
+dropzone.addEventListener('drop', e => { e.preventDefault(); dropzone.classList.remove('dragover'); handleFiles(e.dataTransfer.files); });
+fileInput.addEventListener('change', e => handleFiles(e.target.files));
+
+function handleFiles(files) {
+  const imgs = Array.from(files).filter(f => f.type.startsWith('image/')).slice(0, 2);
+  if (!imgs.length) return;
+  selectedFiles = imgs;
+  renderPreviews();
+  analyzeBtn.disabled = false;
+}
+
+function renderPreviews() {
+  const el = document.getElementById('previews');
+  el.innerHTML = selectedFiles.map(f => `
+    <div class="preview-item">
+      <img src="${URL.createObjectURL(f)}">
+      <div class="info">
+        <div class="name">${f.name.slice(0,20)}</div>
+        <div class="size">${(f.size/1024).toFixed(0)} KB</div>
+      </div>
+    </div>`).join('');
+}
+
+function setStep(n) {
+  for (let i = 1; i <= 3; i++) {
+    const el = document.getElementById(`step${i}`);
+    el.className = 'step' + (i < n ? ' done' : i === n ? ' active' : '');
+  }
+}
+
+function setMsg(msg) {
+  document.getElementById('progressMsg').textContent = msg;
+}
+
+function show(view) {
+  ['upload','progress','results','error'].forEach(v => {
+    document.getElementById(`view-${v}`).style.display = v === view ? 'block' : 'none';
+  });
+}
+
+async function startAnalysis() {
+  show('progress');
+  setStep(1);
+  setMsg('Reading start list...');
+
+  const formData = new FormData();
+  selectedFiles.forEach(f => formData.append('images', f));
+
+  // Fake step progression for UX
+  setTimeout(() => { setStep(2); setMsg('Pre-ranking riders by knowledge...'); }, 4000);
+  setTimeout(() => { setStep(3); setMsg('Searching FirstCycling for top candidates...'); }, 8000);
+
+  try {
+    const resp = await fetch('/analyze', { method: 'POST', body: formData });
+    const data = await resp.json();
+
+    if (data.error) {
+      document.getElementById('errorMsg').textContent = data.error;
+      document.getElementById('errorDetail').textContent = '';
+      show('error');
+      return;
+    }
+
+    renderResults(data);
+    show('results');
+  } catch (err) {
+    document.getElementById('errorMsg').textContent = 'Request failed';
+    document.getElementById('errorDetail').textContent = err.message;
+    show('error');
+  }
+}
+
+function renderResults(data) {
+  document.getElementById('stat-total').textContent = data.total_riders;
+  document.getElementById('stat-searched').textContent = data.searched;
+  const found = data.rankings.filter(r => r.found).length;
+  document.getElementById('stat-found').textContent = found;
+
+  const medals = ['medal-1','medal-2','medal-3'];
+  const el = document.getElementById('rankings');
+  el.innerHTML = data.rankings.map((r, i) => {
+    const rank = i + 1;
+    const medalClass = rank <= 3 ? medals[rank-1] : 'medal-n';
+    const wins = r.wins !== null ? r.wins : '?';
+    const podiums = r.podiums !== null ? r.podiums : '?';
+    const top10 = r.top10s !== null ? r.top10s : '?';
+    const notable = r.notable && r.notable.length ? r.notable.join(' · ') : '';
+
+    return `
+    <div class="rider-card ${rank <= 3 ? 'top3' : ''}">
+      <div class="medal ${medalClass}">${rank}</div>
+      <div class="rider-info">
+        <div class="rider-name">${r.name} <span class="rider-bib">#${r.bib}</span></div>
+        <div class="rider-meta">${r.team}</div>
+        ${notable ? `<div class="notable">${notable}</div>` : ''}
+        ${!r.found ? '<div class="no-data">Not found on FirstCycling</div>' : ''}
+      </div>
+      <div class="stats">
+        <div class="stat-row"><div class="stat-val wins">${wins}</div><div class="stat-lbl">Wins</div></div>
+        <div class="stat-row"><div class="stat-val podiums">${podiums}</div><div class="stat-lbl">Podiums</div></div>
+        <div class="stat-row"><div class="stat-val top10">${top10}</div><div class="stat-lbl">Top 10</div></div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function reset() {
+  selectedFiles = [];
+  document.getElementById('previews').innerHTML = '';
+  document.getElementById('fileInput').value = '';
+  analyzeBtn.disabled = true;
+  show('upload');
+}
+</script>
+</body>
+</html>
