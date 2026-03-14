@@ -1,6 +1,5 @@
 import os
 import re
-import time
 import base64
 import json
 import logging
@@ -14,7 +13,6 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
-
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 FC_HEADERS = {
@@ -52,83 +50,128 @@ Convert to normal caps: VAN DEN BERGHE Nathan -> Nathan Van Den Berghe""",
     return data.get("riders", [])
 
 
-def search_and_get_results(rider: dict) -> dict:
-    """Search FirstCycling for a rider and get their results. Returns enriched rider dict."""
-    name = rider["name"]
-    result = {**rider, "wins": None, "podiums": None, "top10s": None, "notable": [], "found": False}
-
+def find_rider_id(name: str) -> int | None:
+    """Search FirstCycling for a rider by name, return their numeric ID."""
     try:
-        # Search by name
         encoded = requests.utils.quote(name)
         url = f"https://firstcycling.com/search.php?q={encoded}&cat=rider"
         resp = requests.get(url, headers=FC_HEADERS, timeout=10, allow_redirects=True)
-
-        rider_id = None
-
-        # If redirected straight to a rider page
-        if resp.status_code == 200 and "rider.php?r=" in resp.url:
+        if resp.status_code != 200:
+            return None
+        # Redirected straight to rider page?
+        if "rider.php?r=" in resp.url:
             m = re.search(r"r=(\d+)", resp.url)
             if m:
-                rider_id = int(m.group(1))
-
-        # Parse search results page
-        if not rider_id and resp.status_code == 200:
-            soup = BeautifulSoup(resp.text, "html.parser")
-            links = soup.find_all("a", href=re.compile(r"/rider\.php\?r=\d+"))
-            if links:
-                m = re.search(r"r=(\d+)", links[0]["href"])
-                if m:
-                    rider_id = int(m.group(1))
-
-        if not rider_id:
-            log.info(f"Not found on FC: {name}")
-            return result
-
-        log.info(f"Found FC id={rider_id} for {name}")
-        result["found"] = True
-
-        # Fetch results for 2023, 2024, 2025
-        wins, podiums, top10s, notable = 0, 0, 0, []
-        for year in (2023, 2024, 2025):
-            try:
-                r = requests.get(
-                    f"https://firstcycling.com/rider.php?r={rider_id}&y={year}",
-                    headers=FC_HEADERS, timeout=10
-                )
-                if r.status_code != 200:
-                    continue
-                soup = BeautifulSoup(r.text, "html.parser")
-                for row in soup.find_all("tr"):
-                    cols = row.find_all("td")
-                    if len(cols) < 3:
-                        continue
-                    pos_raw = re.sub(r'[^\d]', '', cols[1].get_text(strip=True))
-                    if not pos_raw or len(pos_raw) > 3:
-                        continue
-                    pos = int(pos_raw)
-                    if pos == 0 or pos > 200:
-                        continue
-                    race = cols[2].get_text(strip=True)
-                    if not race or len(race) < 3:
-                        continue
-                    if pos <= 10:
-                        top10s += 1
-                        if pos <= 3:
-                            podiums += 1
-                            if pos == 1:
-                                wins += 1
-                                notable.append(f"🏆 {race} ({year})")
-                            else:
-                                notable.append(f"P{pos} {race} ({year})")
-                time.sleep(0.2)
-            except Exception as e:
-                log.warning(f"Results error {rider_id} {year}: {e}")
-
-        result.update({"wins": wins, "podiums": podiums, "top10s": top10s, "notable": notable[:3]})
-
+                return int(m.group(1))
+        # Parse search results
+        soup = BeautifulSoup(resp.text, "html.parser")
+        link = soup.find("a", href=re.compile(r"/rider\.php\?r=\d+"))
+        if link:
+            m = re.search(r"r=(\d+)", link["href"])
+            if m:
+                return int(m.group(1))
     except Exception as e:
-        log.warning(f"search_and_get_results error for {name}: {e}")
+        log.warning(f"find_rider_id error for {name}: {e}")
+    return None
 
+
+def get_rider_results(rider_id: int) -> dict:
+    """
+    Fetch results for a rider from FirstCycling for 2023-2025.
+    Parses the actual results table correctly using pandas-style column detection.
+    """
+    wins, podiums, top10s, notable = 0, 0, 0, []
+
+    for year in (2023, 2024, 2025):
+        try:
+            url = f"https://firstcycling.com/rider.php?r={rider_id}&y={year}"
+            resp = requests.get(url, headers=FC_HEADERS, timeout=10)
+            if resp.status_code != 200:
+                continue
+
+            soup = BeautifulSoup(resp.text, "html.parser")
+
+            # The results table on FC has a specific structure:
+            # thead with columns: Date | Pos | (blank/flag) | Race | Cat | UCI | (more)
+            # We need to find the correct table by looking for thead with "Pos" header
+            results_table = None
+            for table in soup.find_all("table"):
+                thead = table.find("thead")
+                if thead:
+                    headers = [th.get_text(strip=True) for th in thead.find_all("th")]
+                    if "Pos" in headers and ("Race" in headers or any("race" in h.lower() for h in headers)):
+                        results_table = table
+                        headers_list = headers
+                        break
+
+            if not results_table:
+                # Fallback: any table with a Pos column
+                for table in soup.find_all("table"):
+                    text = table.get_text()
+                    if "Pos" in text and len(table.find_all("tr")) > 3:
+                        results_table = table
+                        # Infer column indices
+                        headers_list = []
+                        break
+
+            if not results_table:
+                continue
+
+            # Find column indices
+            pos_idx = None
+            race_idx = None
+            if headers_list:
+                for i, h in enumerate(headers_list):
+                    if h == "Pos":
+                        pos_idx = i
+                    if h in ("Race", "Race name") or "race" in h.lower():
+                        race_idx = i
+            # Default fallbacks based on typical FC layout: Date(0) Pos(1) flag(2) Race(3)
+            if pos_idx is None:
+                pos_idx = 1
+            if race_idx is None:
+                race_idx = 3
+
+            for row in results_table.find_all("tr"):
+                cols = row.find_all("td")
+                if not cols or len(cols) <= max(pos_idx, race_idx):
+                    continue
+                pos_text = re.sub(r'[^\d]', '', cols[pos_idx].get_text(strip=True))
+                if not pos_text or len(pos_text) > 3:
+                    continue
+                pos = int(pos_text)
+                if pos == 0 or pos > 200:
+                    continue
+                race_name = cols[race_idx].get_text(strip=True)
+                # Skip rows where race name looks like a number or is too short
+                if not race_name or len(race_name) < 4 or race_name.isdigit():
+                    continue
+
+                if pos <= 10:
+                    top10s += 1
+                    if pos <= 3:
+                        podiums += 1
+                        if pos == 1:
+                            wins += 1
+                            notable.append(f"🏆 {race_name} ({year})")
+                        else:
+                            notable.append(f"P{pos} {race_name} ({year})")
+
+        except Exception as e:
+            log.warning(f"get_rider_results error rider={rider_id} year={year}: {e}")
+
+    return {"wins": wins, "podiums": podiums, "top10s": top10s, "notable": notable[:4]}
+
+
+def process_rider(rider: dict) -> dict:
+    result = {**rider, "wins": None, "podiums": None, "top10s": None, "notable": [], "found": False}
+    rider_id = find_rider_id(rider["name"])
+    if rider_id:
+        stats = get_rider_results(rider_id)
+        result.update({**stats, "found": True, "fc_id": rider_id})
+        log.info(f"✓ {rider['name']}: W={stats['wins']} P={stats['podiums']} T10={stats['top10s']}")
+    else:
+        log.info(f"✗ {rider['name']}: not found on FC")
     return result
 
 
@@ -143,7 +186,6 @@ def analyze():
     if not files:
         return jsonify({"error": "No images uploaded"}), 400
 
-    # Extract riders from images
     all_riders = []
     for f in files[:2]:
         raw = f.read()
@@ -167,7 +209,6 @@ def analyze():
         except Exception as e:
             return jsonify({"error": f"Failed to extract riders: {str(e)}"}), 500
 
-    # Deduplicate
     seen = set()
     unique_riders = []
     for r in all_riders:
@@ -178,12 +219,11 @@ def analyze():
     if not unique_riders:
         return jsonify({"error": "No riders found in images"}), 400
 
-    log.info(f"Extracted {len(unique_riders)} unique riders")
+    log.info(f"Processing {len(unique_riders)} riders in parallel...")
 
-    # Search ALL riders on FirstCycling in parallel (max 10 threads)
     enriched = []
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {executor.submit(search_and_get_results, r): r for r in unique_riders}
+    with ThreadPoolExecutor(max_workers=12) as executor:
+        futures = {executor.submit(process_rider, r): r for r in unique_riders}
         for future in as_completed(futures):
             try:
                 enriched.append(future.result())
@@ -191,7 +231,6 @@ def analyze():
                 log.warning(f"Future error: {e}")
                 enriched.append(futures[future])
 
-    # Sort: found riders by podiums desc, then top10s; not-found at bottom
     found = [r for r in enriched if r.get("found")]
     not_found = [r for r in enriched if not r.get("found")]
     found.sort(key=lambda r: (-(r.get("podiums") or 0), -(r.get("top10s") or 0), -(r.get("wins") or 0)))
