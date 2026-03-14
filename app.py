@@ -8,8 +8,14 @@ import requests
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, jsonify, render_template
-from PIL import Image
-import io
+
+# Use the FirstCyclingAPI library for reliable scraping
+try:
+    from first_cycling_api import Rider
+    from first_cycling_api.endpoints import search_rider
+    USE_LIBRARY = True
+except ImportError:
+    USE_LIBRARY = False
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -25,118 +31,129 @@ FC_HEADERS = {
 }
 
 
-def resize_image(raw: bytes, max_width=1400) -> tuple[str, str]:
-    """Resize image and return (base64, mime_type)."""
-    try:
-        img = Image.open(io.BytesIO(raw))
-        if img.width > max_width:
-            ratio = max_width / img.width
-            img = img.resize((max_width, int(img.height * ratio)), Image.LANCZOS)
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=88)
-        return base64.b64encode(buf.getvalue()).decode(), "image/jpeg"
-    except Exception:
-        return base64.b64encode(raw).decode(), "image/jpeg"
-
-
 def extract_riders_from_image(image_b64: str, mime_type: str) -> list[dict]:
-    """Extract riders from a start list image using Claude vision."""
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
-    # Two-shot approach: first extract raw text, then parse it
-    # This avoids Claude trying to format JSON while also reading the image
     response = client.messages.create(
         model="claude-sonnet-4-20250514",
         max_tokens=4000,
+        system="""You read Belgian cycling race start lists. Extract every rider.
+Format is usually: NUMBER  SURNAME Firstname  TEAM  Category  UCI_ID  UCIcld
+UCI_ID looks like BEL20060706 or NOR20050410 (3 letter country code + 8 digits).
+
+Return ONLY valid JSON, nothing else:
+{"riders":[{"bib":"55","name":"Firstname Surname","team":"Team Name","uci_id":"BEL20060706"}]}
+
+Name conversion: VAN DEN BERGHE Nathan -> Nathan Van Den Berghe
+Extract the UCI_ID carefully from the UCI column.""",
         messages=[{
             "role": "user",
             "content": [
-                {
-                    "type": "image",
-                    "source": {"type": "base64", "media_type": mime_type, "data": image_b64}
-                },
-                {
-                    "type": "text",
-                    "text": """This is a Belgian cycling race start list (deelnemerslijst).
-
-Read every single row and extract:
-- Bib number (RUG column, leftmost number)
-- Rider name (NAAM column — ALL CAPS surname + firstname, convert to normal capitalisation)
-- Team name (Club column)
-
-Belgian name prefixes like VAN, DE, VAN DEN, VAN DER, VAN DE must stay attached to the surname.
-Example: VAN DEN BERGHE Nathan → Nathan Van Den Berghe
-Example: DE MILDE Thomas → Thomas De Milde
-
-Return ONLY a JSON array like this, with no other text before or after:
-[
-  {"bib": "55", "name": "Nathan Van Den Berghe", "team": "VP Consulting"},
-  {"bib": "23", "name": "Thomas De Milde", "team": "VP Consulting"}
-]"""
-                }
+                {"type": "image", "source": {"type": "base64", "media_type": mime_type, "data": image_b64}},
+                {"type": "text", "text": "Extract all riders including their UCI ID. Return only JSON."}
             ]
         }]
     )
-
-    raw = response.content[0].text.strip()
-    log.info(f"Raw extraction response (first 300 chars): {raw[:300]}")
-
-    # Strip any markdown fences
-    raw = re.sub(r'^```json\s*', '', raw, flags=re.MULTILINE)
-    raw = re.sub(r'^```\s*', '', raw, flags=re.MULTILINE)
-    raw = re.sub(r'```$', '', raw, flags=re.MULTILINE)
-    raw = raw.strip()
-
-    # Try to find a JSON array
-    # Sometimes Claude wraps it in {"riders": [...]} — handle both
-    try:
-        parsed = json.loads(raw)
-        if isinstance(parsed, list):
-            return parsed
-        if isinstance(parsed, dict):
-            for key in ("riders", "data", "results"):
-                if key in parsed and isinstance(parsed[key], list):
-                    return parsed[key]
-    except json.JSONDecodeError:
-        pass
-
-    # Try to extract just the array part
-    array_match = re.search(r'\[[\s\S]*\]', raw)
-    if array_match:
-        try:
-            parsed = json.loads(array_match.group(0))
-            if isinstance(parsed, list):
-                return parsed
-        except json.JSONDecodeError:
-            pass
-
-    log.error(f"Could not parse extraction response: {raw[:500]}")
-    raise ValueError(f"Could not parse rider list from image. Raw response started with: {raw[:200]}")
+    text = response.content[0].text.strip()
+    text = re.sub(r'^```json\s*', '', text)
+    text = re.sub(r'\s*```$', '', text)
+    data = json.loads(text)
+    return data.get("riders", [])
 
 
 def find_rider_id(name: str) -> int | None:
+    """Find rider FC ID. Try library first, fall back to raw search."""
+
+    # Method 1: Use the library's search if available
+    if USE_LIBRARY:
+        try:
+            results = search_rider(name)
+            if results and len(results) > 0:
+                # Returns list of (id, name) tuples or similar
+                first = results[0]
+                if isinstance(first, (list, tuple)):
+                    return int(first[0])
+                elif isinstance(first, dict):
+                    return int(first.get('id') or first.get('rider_id'))
+        except Exception as e:
+            log.warning(f"Library search failed for {name}: {e}")
+
+    # Method 2: Direct HTTP search
     try:
-        encoded = requests.utils.quote(name)
-        url = f"https://firstcycling.com/search.php?q={encoded}&cat=rider"
-        resp = requests.get(url, headers=FC_HEADERS, timeout=10, allow_redirects=True)
-        if resp.status_code != 200:
-            return None
-        if "rider.php?r=" in resp.url:
-            m = re.search(r"r=(\d+)", resp.url)
-            if m:
-                return int(m.group(1))
-        soup = BeautifulSoup(resp.text, "html.parser")
-        link = soup.find("a", href=re.compile(r"/rider\.php\?r=\d+"))
-        if link:
-            m = re.search(r"r=(\d+)", link["href"])
-            if m:
-                return int(m.group(1))
+        # Try full name first
+        for query in [name, " ".join(reversed(name.split()))]:
+            encoded = requests.utils.quote(query)
+            url = f"https://firstcycling.com/search.php?q={encoded}&cat=rider"
+            resp = requests.get(url, headers=FC_HEADERS, timeout=10, allow_redirects=True)
+
+            if resp.status_code != 200:
+                continue
+
+            # Redirected directly to rider page
+            if "rider.php?r=" in resp.url:
+                m = re.search(r"r=(\d+)", resp.url)
+                if m:
+                    log.info(f"Found {name} via redirect: {m.group(1)}")
+                    return int(m.group(1))
+
+            soup = BeautifulSoup(resp.text, "html.parser")
+
+            # Look for rider links in search results
+            # FC search results have rider names as links
+            for a in soup.find_all("a", href=re.compile(r"rider\.php\?r=\d+")):
+                m = re.search(r"r=(\d+)", a["href"])
+                if m:
+                    log.info(f"Found {name} via search link: {m.group(1)}")
+                    return int(m.group(1))
+
     except Exception as e:
-        log.warning(f"find_rider_id error for {name}: {e}")
+        log.warning(f"HTTP search failed for {name}: {e}")
+
     return None
 
 
-def get_rider_results(rider_id: int) -> dict:
+def get_results_via_library(rider_id: int) -> dict:
+    """Use FirstCyclingAPI library to get results."""
+    wins, podiums, top10s, notable = 0, 0, 0, []
+    try:
+        rider = Rider(rider_id)
+        for year in (2023, 2024, 2025):
+            try:
+                yr = rider.year_results(year)
+                df = yr.results_df
+                if df is None or df.empty:
+                    continue
+                for _, row in df.iterrows():
+                    try:
+                        pos_raw = str(row.get('Pos', '')).strip()
+                        pos_raw = re.sub(r'[^\d]', '', pos_raw)
+                        if not pos_raw:
+                            continue
+                        pos = int(pos_raw)
+                        if pos == 0 or pos > 200:
+                            continue
+                        race = str(row.get('Race', '')).strip()
+                        if not race or len(race) < 3:
+                            continue
+                        if pos <= 10:
+                            top10s += 1
+                            if pos <= 3:
+                                podiums += 1
+                                if pos == 1:
+                                    wins += 1
+                                    notable.append(f"🏆 {race} ({year})")
+                                else:
+                                    notable.append(f"P{pos} {race} ({year})")
+                    except Exception:
+                        continue
+            except Exception as e:
+                log.warning(f"Year results error {rider_id}/{year}: {e}")
+    except Exception as e:
+        log.warning(f"Library results error {rider_id}: {e}")
+    return {"wins": wins, "podiums": podiums, "top10s": top10s, "notable": notable[:4]}
+
+
+def get_results_via_http(rider_id: int) -> dict:
+    """Direct HTTP scraping with correct column detection."""
     wins, podiums, top10s, notable = 0, 0, 0, []
 
     for year in (2023, 2024, 2025):
@@ -148,32 +165,36 @@ def get_rider_results(rider_id: int) -> dict:
 
             soup = BeautifulSoup(resp.text, "html.parser")
 
-            # Find the results table — look for thead with Pos + Race columns
+            # Find the correct results table by its thead
             results_table = None
-            pos_idx, race_idx = 1, 3  # FC defaults
+            pos_idx, race_idx = None, None
 
             for table in soup.find_all("table"):
                 thead = table.find("thead")
                 if not thead:
                     continue
-                ths = thead.find_all("th")
-                headers = [th.get_text(strip=True) for th in ths]
-                if "Pos" in headers:
+                ths = [th.get_text(strip=True) for th in thead.find_all(["th", "td"])]
+                if "Pos" in ths:
                     results_table = table
-                    pos_idx = headers.index("Pos")
-                    # Race is usually after a flag column
-                    for i, h in enumerate(headers):
-                        if h in ("Race", "Race name", "Wedstrijd"):
+                    pos_idx = ths.index("Pos")
+                    # Race column is usually after a flag column
+                    for i, h in enumerate(ths):
+                        if h in ("Race", "Race name", "") and i > pos_idx:
                             race_idx = i
                             break
+                    if race_idx is None:
+                        race_idx = pos_idx + 2  # typical FC layout: Pos, flag, Race
                     break
 
             if not results_table:
+                log.warning(f"No results table found for rider {rider_id} year {year}")
                 continue
+
+            log.info(f"Rider {rider_id} year {year}: pos_idx={pos_idx} race_idx={race_idx}")
 
             for row in results_table.find_all("tr"):
                 cols = row.find_all("td")
-                if len(cols) <= max(pos_idx, race_idx):
+                if not cols or len(cols) <= max(pos_idx, race_idx):
                     continue
 
                 pos_text = re.sub(r'[^\d]', '', cols[pos_idx].get_text(strip=True))
@@ -183,9 +204,11 @@ def get_rider_results(rider_id: int) -> dict:
                 if pos == 0 or pos > 200:
                     continue
 
-                race_name = cols[race_idx].get_text(strip=True)
-                if not race_name or len(race_name) < 4 or race_name.isdigit():
+                race = cols[race_idx].get_text(strip=True)
+                if not race or len(race) < 4 or race.isdigit():
                     continue
+
+                log.info(f"  pos={pos} race={race}")
 
                 if pos <= 10:
                     top10s += 1
@@ -193,25 +216,33 @@ def get_rider_results(rider_id: int) -> dict:
                         podiums += 1
                         if pos == 1:
                             wins += 1
-                            notable.append(f"🏆 {race_name} ({year})")
+                            notable.append(f"🏆 {race} ({year})")
                         else:
-                            notable.append(f"P{pos} {race_name} ({year})")
+                            notable.append(f"P{pos} {race} ({year})")
 
         except Exception as e:
-            log.warning(f"get_rider_results error {rider_id} {year}: {e}")
+            log.warning(f"HTTP results error {rider_id}/{year}: {e}")
 
     return {"wins": wins, "podiums": podiums, "top10s": top10s, "notable": notable[:4]}
 
 
 def process_rider(rider: dict) -> dict:
     result = {**rider, "wins": None, "podiums": None, "top10s": None, "notable": [], "found": False}
+
     rider_id = find_rider_id(rider["name"])
-    if rider_id:
-        stats = get_rider_results(rider_id)
-        result.update({**stats, "found": True})
-        log.info(f"✓ {rider['name']}: W={stats['wins']} P={stats['podiums']} T10={stats['top10s']}")
+    if not rider_id:
+        log.info(f"✗ Not found: {rider['name']}")
+        return result
+
+    log.info(f"✓ {rider['name']} -> fc_id={rider_id}")
+
+    if USE_LIBRARY:
+        stats = get_results_via_library(rider_id)
     else:
-        log.info(f"✗ {rider['name']}: not found on FC")
+        stats = get_results_via_http(rider_id)
+
+    log.info(f"  W={stats['wins']} P={stats['podiums']} T10={stats['top10s']}")
+    result.update({**stats, "found": True, "fc_id": rider_id})
     return result
 
 
@@ -229,45 +260,38 @@ def analyze():
     all_riders = []
     for f in files[:2]:
         raw = f.read()
-        b64, mime = resize_image(raw)
+        b64 = base64.b64encode(raw).decode()
+        mime = f.content_type or "image/jpeg"
+        if len(raw) > 3_000_000:
+            try:
+                from PIL import Image
+                import io
+                img = Image.open(io.BytesIO(raw))
+                img.thumbnail((1400, 1400))
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=85)
+                b64 = base64.b64encode(buf.getvalue()).decode()
+                mime = "image/jpeg"
+            except Exception:
+                pass
         try:
             riders = extract_riders_from_image(b64, mime)
-            log.info(f"Extracted {len(riders)} riders from image")
             all_riders.extend(riders)
         except Exception as e:
-            return jsonify({"error": str(e)}), 500
+            return jsonify({"error": f"Failed to extract riders: {str(e)}"}), 500
 
-    # Deduplicate by name
     seen = set()
     unique_riders = []
     for r in all_riders:
-        name = r.get("name", "").strip()
-        if name and name not in seen:
-            seen.add(name)
+        if r["name"] not in seen:
+            seen.add(r["name"])
             unique_riders.append(r)
 
     if not unique_riders:
-        return jsonify({"error": "No riders found — make sure the photo clearly shows the start list text"}), 400
+        return jsonify({"error": "No riders found in images"}), 400
 
-    # Sanity check: a real start list has at least 20 riders
-    # If we got fewer, the image probably wasn't read correctly
-    if len(unique_riders) < 20:
-        return jsonify({
-            "error": f"Only {len(unique_riders)} riders detected — image may be blurry, too dark, or not showing the full start list. Please retake the photo and try again.",
-            "partial_riders": [r["name"] for r in unique_riders]
-        }), 400
+    log.info(f"Processing {len(unique_riders)} riders (library={'yes' if USE_LIBRARY else 'no'})...")
 
-    # Sanity check: names should look like real names (2+ words, letters only mostly)
-    suspicious = [r for r in unique_riders if len(r["name"].split()) < 2 or re.search(r'\d{4}', r["name"])]
-    if len(suspicious) > len(unique_riders) * 0.3:
-        return jsonify({
-            "error": "Rider names don't look right — the image may not be a start list, or the text is not readable. Please try a clearer photo.",
-            "sample": [r["name"] for r in unique_riders[:5]]
-        }), 400
-
-    log.info(f"Total unique riders: {len(unique_riders)} — looks valid, proceeding")
-
-    # Search all riders on FC in parallel
     enriched = []
     with ThreadPoolExecutor(max_workers=12) as executor:
         futures = {executor.submit(process_rider, r): r for r in unique_riders}
@@ -280,12 +304,14 @@ def analyze():
 
     found = [r for r in enriched if r.get("found")]
     not_found = [r for r in enriched if not r.get("found")]
-    found.sort(key=lambda r: (-(r.get("podiums") or 0), -(r.get("top10s") or 0), -(r.get("wins") or 0)))
+    found.sort(key=lambda r: (-(r.get("podiums") or 0), -(r.get("wins") or 0), -(r.get("top10s") or 0)))
+
+    top10 = (found + not_found)[:10]
 
     return jsonify({
         "total_riders": len(unique_riders),
         "found_on_fc": len(found),
-        "rankings": (found + not_found)[:10]
+        "rankings": top10
     })
 
 
