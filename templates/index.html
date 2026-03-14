@@ -195,7 +195,7 @@
   <div id="view-results" style="display:none">
     <div class="summary">
       <div class="summary-stat"><div class="val" id="stat-total">—</div><div class="lbl">Riders</div></div>
-      <div class="summary-stat"><div class="val" id="stat-searched" style="color:#aaa">—</div><div class="lbl">Searched</div></div>
+      <div class="summary-stat"><div class="val" id="stat-searched" style="color:#aaa">—</div><div class="lbl">Found on FC</div></div>
       <div class="summary-stat"><div class="val" id="stat-found" style="color:#666">—</div><div class="lbl">Found on FC</div></div>
     </div>
     <div class="section-title">Top 10 — Podiums & Results (2024–2025)</div>
@@ -272,8 +272,8 @@ async function startAnalysis() {
   selectedFiles.forEach(f => formData.append('images', f));
 
   // Fake step progression for UX
-  setTimeout(() => { setStep(2); setMsg('Pre-ranking riders by knowledge...'); }, 4000);
-  setTimeout(() => { setStep(3); setMsg('Searching FirstCycling for top candidates...'); }, 8000);
+  setTimeout(() => { setStep(2); setMsg('Searching all riders on FirstCycling...'); }, 4000);
+  setTimeout(() => { setStep(3); setMsg('Building results table...'); }, 8000);
 
   try {
     const resp = await fetch('/analyze', { method: 'POST', body: formData });
@@ -297,7 +297,7 @@ async function startAnalysis() {
 
 function renderResults(data) {
   document.getElementById('stat-total').textContent = data.total_riders;
-  document.getElementById('stat-searched').textContent = data.searched;
+  document.getElementById('stat-searched').textContent = data.found_on_fc;
   const found = data.rankings.filter(r => r.found).length;
   document.getElementById('stat-found').textContent = found;
 
