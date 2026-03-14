@@ -4,6 +4,5 @@ requests==2.32.3
 beautifulsoup4==4.12.3
 Pillow==10.4.0
 gunicorn==22.0.0
-git+https://github.com/baronet2/FirstCyclingAPI.git
 pandas>=2.0.0
 lxml>=4.9.0
